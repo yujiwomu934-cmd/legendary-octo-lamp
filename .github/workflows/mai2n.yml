@@ -1,0 +1,144 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP Core settings configured successfully!"
+
+      - name: Optimize RDP Performance
+        run: |
+          New-Item -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fEnableWinStation" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "fEnableVirtualizedGraphics" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "ColorDepth" -Value 4 -Force
+          Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxCompressionLevel" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "AVC444ModePreferred" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "AVCHardwareEncodePreferred" -Value 1 -Force
+          Write-Host "RDP optimized for high-quality graphics"
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          try {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
+          } catch {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Optional – Remove Existing BlueStacks
+        run: |
+          Write-Host "Attempting silent removal of any existing BlueStacks..."
+          # Try vendor cleaner first
+          $temp = $env:TEMP
+          $cleaner = Join-Path $temp "BS_Cleaner.exe"
+          $urls = @(
+            "https://cdn3.bluestacks.com/support/BS5/BlueStacksCleaner5.exe",
+            "https://cdn3.bluestacks.com/support/BS5/BSTCleaner_native.exe"
+          )
+          $downloaded = $false
+          foreach ($u in $urls) {
+            try { Invoke-WebRequest -Uri $u -OutFile $cleaner -UseBasicParsing -TimeoutSec 45; if (Test-Path $cleaner){$downloaded=$true;break} } catch {}
+          }
+          if ($downloaded) {
+            try { Start-Process -FilePath $cleaner -ArgumentList "/S" -Wait -NoNewWindow } catch { Start-Process -FilePath $cleaner -Wait }
+          }
+
+          # Fallback: uninstall via registered uninstallers (MSI/EXE)
+          $uninstallRoots = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+          )
+          foreach ($root in $uninstallRoots) {
+            Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+              $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+              if ($p.DisplayName -and $p.DisplayName -match "BlueStacks") {
+                if ($p.UninstallString) {
+                  if ($p.UninstallString -match "MsiExec") {
+                    Start-Process cmd.exe -ArgumentList "/c",$p.UninstallString,"/qn","/norestart" -Wait -WindowStyle Hidden
+                  } else {
+                    Start-Process cmd.exe -ArgumentList "/c","`"$($p.UninstallString)`" /S" -Wait -WindowStyle Hidden
+                  }
+                }
+              }
+            }
+          }
+
+          # Cleanup leftovers
+          $paths = @(
+            "C:\Program Files\BlueStacks_nxt",
+            "C:\Program Files (x86)\BlueStacks_nxt",
+            "C:\ProgramData\BlueStacks_nxt",
+            "$env:LOCALAPPDATA\BlueStacks",
+            "$env:APPDATA\BlueStacks"
+          )
+          foreach ($p in $paths) { if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue } }
+          Write-Host "BlueStacks removal attempt complete"
+        shell: pwsh
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 120
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          if (-not $tsIP) { Write-Error "No Tailscale IPv4 assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) { Write-Error "RDP port 3389 not reachable over Tailscale"; exit 1 }
+
+      - name: Send RDP Details to Telegram
+        run: |
+          $botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          $chatId = "${{ secrets.TELEGRAM_CHAT_ID }}"
+          if ($botToken -and $chatId) {
+            $msg = "Windows RDP Ready`n`nIP: $env:TAILSCALE_IP`nUser: RDP`nPass: $env:RDP_PASSWORD`n`nNo BlueStacks installed."
+            $body = @{ chat_id = $chatId; text = $msg; disable_web_page_preview = $true } | ConvertTo-Json
+            Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Method POST -ContentType "application/json" -Body $body
+          }
+
+      - name: Maintain Connection
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Server Active at $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 5
+          }
